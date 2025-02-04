@@ -11,9 +11,9 @@ import (
 	"github.com/dennesshen/photon-core-starter/utils/future"
 	"reflect"
 	"time"
-	
+
 	"github.com/google/uuid"
-	
+
 	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
 )
@@ -47,47 +47,52 @@ func Start(ctx context.Context) error {
 	if config.Websocket.ContextPath != "" {
 		path = path + config.Websocket.ContextPath
 	}
-	
-	for _, endpoint := range socketEndPoints {
-		endpointPath := path + endpoint.GetEndpointPath()
+
+	for key, value := range enpointAndHandlersMap {
+		endpointPath := path + key
 		log.Logger().Info(ctx, "Registering websocket endpoint: "+endpointPath)
-		
-		component.Server.Get(endpointPath, SocketUpgradeHandler,
-			websocket.New(func(c *websocket.Conn) {
-				userCtx := getContext(c)
-				instance := shallowCopy(endpoint)
-				conn := &WSConn{Conn: c, ctx: userCtx, id: generateId(c)}
-				wsConnections[conn.Id()] = pair{wsConn: conn, endpoint: &instance}
-				conn.SetCloseHandler(instance.OnClose)
-				conn.SetPingHandler(instance.OnPing)
-				conn.SetPongHandler(instance.OnPong)
-				
-				if err := instance.OnOpen(conn); err != nil {
-					closeProcessWithErr(conn, &instance, err)
-					return
-				}
-				startPingPong(conn)
-				for {
-					_, msg, err := conn.ReadMessage()
-					if err != nil {
-						if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-							closeProcess(conn, &instance)
-							return
-						}
-						closeProcessWithErr(conn, &instance, err)
-						return
-					}
-					if err = instance.OnMessage(conn, string(msg)); err != nil {
-						closeProcessWithErr(conn, &instance, err)
-						return
-					}
-				}
-			}),
-		)
+
+		handlers := make([]fiber.Handler, len(value.middlewares)+2)
+		handlers[0] = SocketUpgradeHandler
+		copy(handlers[1:], value.middlewares)
+		handlers[len(handlers)-1] = getEndpointHandler(value)
+		component.Server.Get(endpointPath, handlers...)
 	}
 	return nil
 }
 
+func getEndpointHandler(endpointAndHandlers EndpointAndHandlers) fiber.Handler {
+	return websocket.New(func(c *websocket.Conn) {
+		userCtx := getContext(c)
+		instance := shallowCopy(endpointAndHandlers.endpoint)
+		conn := &WSConn{Conn: c, ctx: userCtx, id: generateId(c)}
+		wsConnections[conn.Id()] = pair{wsConn: conn, endpoint: &instance}
+		conn.SetCloseHandler(instance.OnClose)
+		conn.SetPingHandler(instance.OnPing)
+		conn.SetPongHandler(instance.OnPong)
+
+		if err := instance.OnOpen(conn); err != nil {
+			closeProcessWithErr(conn, &instance, err)
+			return
+		}
+		startPingPong(conn)
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+					closeProcess(conn, &instance)
+					return
+				}
+				closeProcessWithErr(conn, &instance, err)
+				return
+			}
+			if err = instance.OnMessage(conn, string(msg)); err != nil {
+				closeProcessWithErr(conn, &instance, err)
+				return
+			}
+		}
+	})
+}
 func generateId(c *websocket.Conn) string {
 	uuid := uuid.New()
 	headers, _ := c.Locals("headers").(map[string][]string)
