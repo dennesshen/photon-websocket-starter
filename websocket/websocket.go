@@ -18,11 +18,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-type pair struct {
-	wsConn   *WSConn
-	endpoint *SocketEndpoint
-}
-
 func init() {
 	bean.Autowire(&component)
 }
@@ -31,13 +26,15 @@ var component struct {
 	Server *fiber.App `autowired:"true"`
 }
 
-var wsConnections = make(map[string]pair)
+var wsConnections = make(map[string]*WSConn)
 
 func Shutdown(ctx context.Context) error {
 	log.Logger().Info(ctx, "shutting down websocket server")
-	for _, pair := range wsConnections {
-		(*pair.endpoint).OnClose(websocket.CloseAbnormalClosure, "server shutdown")
-		_ = pair.wsConn.Close()
+	for _, conn := range wsConnections {
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "server shutdown"),
+			time.Now().Add(3*time.Second))
+		conn.close()
 	}
 	return nil
 }
@@ -48,7 +45,7 @@ func Start(ctx context.Context) error {
 		path = path + config.Websocket.ContextPath
 	}
 
-	for key, value := range enpointAndHandlersMap {
+	for key, value := range endpointAndHandlersMap {
 		endpointPath := path + key
 		log.Logger().Info(ctx, "Registering websocket endpoint: "+endpointPath)
 
@@ -62,37 +59,28 @@ func Start(ctx context.Context) error {
 }
 
 func getEndpointHandler(endpointAndHandlers EndpointAndHandlers) fiber.Handler {
-	return websocket.New(func(c *websocket.Conn) {
-		userCtx := getContext(c)
-		instance := shallowCopy(endpointAndHandlers.endpoint)
-		conn := &WSConn{Conn: c, ctx: userCtx, id: generateId(c)}
-		wsConnections[conn.Id()] = pair{wsConn: conn, endpoint: &instance}
-		conn.SetCloseHandler(instance.OnClose)
-		conn.SetPingHandler(instance.OnPing)
-		conn.SetPongHandler(instance.OnPong)
 
-		if err := instance.OnOpen(conn); err != nil {
-			closeProcessWithErr(conn, &instance, err)
+	return websocket.New(func(c *websocket.Conn) {
+
+		instance := shallowCopy(endpointAndHandlers.endpoint)
+		c.SetCloseHandler(instance.OnClose)
+		c.SetPingHandler(instance.OnPing)
+		c.SetPongHandler(instance.OnPong)
+		conn := &WSConn{conn: c, ctx: context.Background(), id: generateId(c), instance: instance}
+
+		wsConnections[conn.Id()] = conn
+		defer delete(wsConnections, conn.Id())
+
+		if err := conn.onOpen(); err != nil {
 			return
 		}
+
 		startPingPong(conn)
-		for {
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-					closeProcess(conn, &instance)
-					return
-				}
-				closeProcessWithErr(conn, &instance, err)
-				return
-			}
-			if err = instance.OnMessage(conn, string(msg)); err != nil {
-				closeProcessWithErr(conn, &instance, err)
-				return
-			}
-		}
+		conn.startListen()
+
 	})
 }
+
 func generateId(c *websocket.Conn) string {
 	uuid := uuid.New()
 	headers, _ := c.Locals("headers").(map[string][]string)
@@ -101,36 +89,6 @@ func generateId(c *websocket.Conn) string {
 	key := fmt.Sprintf("%s%s%d%v", uuid.String(), ip, timestamp, headers)
 	sum256 := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum256[:])
-}
-
-func getContext(c *websocket.Conn) context.Context {
-	var userCtx context.Context
-	if fiberCtx, ok := c.Locals("user_context").(context.Context); ok {
-		userCtx = fiberCtx
-	} else {
-		panic("user_context not found")
-	}
-	return userCtx
-}
-
-func closeProcessWithErr(conn *WSConn, s *SocketEndpoint, err error) {
-	_ = conn.WriteControl(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseUnsupportedData, err.Error()),
-		time.Now().Add(3*time.Second))
-	(*s).OnError(conn, err)
-	if err := (*s).OnClose(websocket.CloseUnsupportedData, err.Error()); err != nil {
-		log.Logger().Error(conn.Ctx(), "Close websocket error: "+err.Error())
-	}
-	conn.Close()
-	delete(wsConnections, conn.Id())
-}
-
-func closeProcess(conn *WSConn, s *SocketEndpoint) {
-	if err := (*s).OnClose(websocket.CloseNormalClosure, ""); err != nil {
-		log.Logger().Error(conn.Ctx(), "Close websocket error: "+err.Error())
-	}
-	conn.Close()
-	delete(wsConnections, conn.Id())
 }
 
 func startPingPong(wsConn *WSConn) {
@@ -173,13 +131,12 @@ func shallowCopy[T any](t T) T {
 func SocketUpgradeHandler(ctx *fiber.Ctx) error {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Logger().Error(ctx.UserContext(), "SocketUpgradeHandler panic", "error", r)
+			log.Logger().Error(ctx.UserContext(), "WebsocketHandler panic", "error", r)
 		}
 	}()
 	if !websocket.IsWebSocketUpgrade(ctx) {
 		return fiber.ErrUpgradeRequired
 	}
 	ctx.Locals("headers", ctx.GetReqHeaders())
-	ctx.Locals("user_context", ctx.UserContext())
 	return ctx.Next()
 }
