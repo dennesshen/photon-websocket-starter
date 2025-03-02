@@ -75,7 +75,9 @@ func getEndpointHandler(endpointAndHandlers EndpointAndHandlers) fiber.Handler {
 			return
 		}
 
-		startPingPong(conn)
+		counter := startPingPong(conn)
+		defer counter.Stop()
+
 		conn.startListen()
 
 	})
@@ -91,13 +93,13 @@ func generateId(c *websocket.Conn) string {
 	return hex.EncodeToString(sum256[:])
 }
 
-func startPingPong(wsConn *WSConn) {
+func startPingPong(wsConn *WSConn) *counter.Counter {
+	duration := config.Websocket.PingIntervalSecond
+	if duration == 0 {
+		duration = 30
+	}
+	ticker := counter.NewCounter(time.Second * time.Duration(duration))
 	future.RunAsync(func() error {
-		duration := config.Websocket.PingIntervalSecond
-		if duration == 0 {
-			duration = 30
-		}
-		ticker := counter.NewCounter(time.Second * time.Duration(duration))
 		for {
 			select {
 			case <-ticker.Touch():
@@ -110,6 +112,7 @@ func startPingPong(wsConn *WSConn) {
 			}
 		}
 	})
+	return ticker
 }
 
 func shallowCopy[T any](t T) T {
