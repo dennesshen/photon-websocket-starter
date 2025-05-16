@@ -10,6 +10,7 @@ import (
 	"github.com/dennesshen/photon-core-starter/utils/counter"
 	"github.com/dennesshen/photon-core-starter/utils/future"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,16 +27,22 @@ var component struct {
 	Server *fiber.App `autowired:"true"`
 }
 
-var wsConnections = make(map[string]*WSConn)
+//var wsConnections = make([string]*WSConn)
+
+var wsConnections sync.Map
 
 func Shutdown(ctx context.Context) error {
 	log.Logger().Info(ctx, "shutting down websocket server")
-	for _, conn := range wsConnections {
+	wsConnections.Range(func(key, value interface{}) bool {
+		conn := value.(*WSConn) // 你需要斷言成你的類型
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "server shutdown"),
 			time.Now().Add(3*time.Second))
 		conn.close()
-	}
+
+		return true
+	})
+
 	return nil
 }
 
@@ -68,8 +75,8 @@ func getEndpointHandler(endpointAndHandlers EndpointAndHandlers) fiber.Handler {
 		c.SetPongHandler(instance.OnPong)
 		conn := &WSConn{conn: c, ctx: context.Background(), id: generateId(c), instance: instance}
 
-		wsConnections[conn.Id()] = conn
-		defer delete(wsConnections, conn.Id())
+		wsConnections.Store(conn.Id(), conn)
+		defer wsConnections.Delete(conn.Id())
 
 		if err := conn.onOpen(); err != nil {
 			return
